@@ -3,3 +3,7 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+
+# local-only bootstrap tooling and virtualenv (not part of the image build)
+.venv/
+.bootstrap/

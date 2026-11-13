@@ -8,8 +8,9 @@ services:
     build: ./crawler
     environment:
       DATABASE_PATH: /data/crawler.db
+      PACKAGES_DIR: /data/packages   # immutable ZIP packages, same persistent volume
     volumes:
-      - crawler_data:/data        # crawl state survives restarts
+      - crawler_data:/data        # crawl state AND published packages survive restarts
     ports:
       - "8000:8000"               # interactive API docs: http://localhost:8000/docs
     depends_on:

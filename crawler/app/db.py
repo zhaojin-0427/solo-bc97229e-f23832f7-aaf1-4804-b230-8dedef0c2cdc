@@ -44,6 +44,26 @@ CREATE TABLE IF NOT EXISTS citations (
     dst_url TEXT NOT NULL,
     PRIMARY KEY (job_id, src_url, dst_url)         -- an edge is stored at most once
 );
+
+CREATE TABLE IF NOT EXISTS publications (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id            INTEGER NOT NULL REFERENCES jobs(id),
+    status            TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+    stage             TEXT NOT NULL DEFAULT 'queued',  -- queued | snapshot | papers | citations
+                                                       -- | meta | finalizing | completed | failed
+    progress          INTEGER NOT NULL DEFAULT 0,      -- 0..100
+    papers_count      INTEGER,                          -- total rows in the frozen snapshot
+    citations_count   INTEGER,
+    papers_exported   INTEGER NOT NULL DEFAULT 0,
+    citations_exported INTEGER NOT NULL DEFAULT 0,
+    file_name         TEXT,                             -- set only once the ZIP is fully persisted
+    file_size         INTEGER,
+    error             TEXT,
+    created_at        TEXT NOT NULL,
+    started_at        TEXT,
+    finished_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_publications_job ON publications(job_id);
 """
 
 # paper statuses
@@ -60,6 +80,12 @@ JOB_RUNNING = "running"
 JOB_COMPLETED = "completed"
 JOB_FAILED = "failed"
 
+# publication statuses
+PUB_QUEUED = "queued"
+PUB_RUNNING = "running"
+PUB_COMPLETED = "completed"
+PUB_FAILED = "failed"
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -72,6 +98,7 @@ def same_origin(url: str, origin: str) -> bool:
 
 class Database:
     def __init__(self, path: str):
+        self.path = path
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -348,3 +375,104 @@ class Database:
                     (job_id, FAILED),
                 ).fetchall()
             ]
+
+    # ---------------------------------------------------------- publications
+
+    def create_publication(self, job_id: int) -> int:
+        """Register a publish request. The row exists as 'queued' before any
+        file work starts, so a crash always leaves a recoverable record."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO publications(job_id, status, stage, created_at)"
+                " VALUES (?,?,?,?)",
+                (job_id, PUB_QUEUED, PUB_QUEUED, utcnow()),
+            )
+            return cur.lastrowid
+
+    def get_publication(self, pub_id: int):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM publications WHERE id=?", (pub_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_publications(self, job_id: int | None = None):
+        with self._lock:
+            if job_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM publications ORDER BY id"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM publications WHERE job_id=? ORDER BY id",
+                    (job_id,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_publication_running(self, pub_id: int):
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE publications SET status=?, stage=?, progress=0, started_at=? WHERE id=?",
+                (PUB_RUNNING, "snapshot", utcnow(), pub_id),
+            )
+
+    def update_publication_progress(
+        self, pub_id: int, stage: str, progress: int,
+        papers_exported: int | None = None, citations_exported: int | None = None,
+    ):
+        """A short write so progress reporting never holds a long lock while the
+        background scan streams its snapshot on a separate connection."""
+        progress = max(0, min(100, int(progress)))
+        with self._tx() as conn:
+            if papers_exported is None or citations_exported is None:
+                conn.execute(
+                    "UPDATE publications SET stage=?, progress=? WHERE id=?",
+                    (stage, progress, pub_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE publications SET stage=?, progress=?, papers_exported=?,"
+                    " citations_exported=? WHERE id=?",
+                    (stage, progress, papers_exported, citations_exported, pub_id),
+                )
+
+    def mark_publication_complete(
+        self, pub_id: int, file_name: str, file_size: int,
+        papers_count: int, citations_count: int,
+    ):
+        """Success is registered only after the ZIP is fully on disk.
+        Done in one transaction and guarded against double completion."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE publications SET status=?, stage=?, progress=100,"
+                " papers_count=?, citations_count=?, papers_exported=?,"
+                " citations_exported=?, file_name=?, file_size=?, error=NULL,"
+                " finished_at=? WHERE id=? AND status!=?",
+                (PUB_COMPLETED, "completed", papers_count, citations_count,
+                 papers_count, citations_count, file_name, file_size,
+                 utcnow(), pub_id, PUB_COMPLETED),
+            )
+
+    def mark_publication_failed(self, pub_id: int, error: str):
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE publications SET status=?, stage=?, error=?, finished_at=? WHERE id=?",
+                (PUB_FAILED, "failed", error[:2000], utcnow(), pub_id),
+            )
+
+    def list_unfinished_publications(self):
+        """Publications that never reached a terminal state before shutdown."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM publications WHERE status IN (?,?) ORDER BY id",
+                (PUB_QUEUED, PUB_RUNNING),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_completed_publications(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM publications WHERE status=? ORDER BY id",
+                (PUB_COMPLETED,),
+            ).fetchall()
+            return [dict(r) for r in rows]

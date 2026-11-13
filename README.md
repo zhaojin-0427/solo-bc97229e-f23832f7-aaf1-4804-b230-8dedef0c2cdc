@@ -3,6 +3,9 @@
 沿论文站的参考文献构建引用语料的采集系统：**FastAPI + SQLite** 采集 API、双采集槽并发、
 全量状态持久化、中断自动续采，附带一个含循环引用 / 迟到短路径 / 一次请求失败的本地论文站。
 
+新增**发布 API**：按作业在后台生成不可变 ZIP 快照（`papers.csv` / `citations.csv` /
+`meta.json`），供学术计量分析的离线程序消费，同一份语料可凭包号重复下载、逐字节复跑。
+
 ## 快速开始
 
 ```bash
@@ -53,6 +56,49 @@ by_depth: {0:1, 1:3, 2:6, 3:3, 4:3}     # X 已在深度 2，Y 在 3，Z 在 4
 - `GET /jobs/1/papers`（可按 `status`、`depth` 过滤）— 论文 URL、深度、题名、状态
 - `GET /jobs/1/citations`（可按 `src` 过滤）— 引用边
 
+**7. 发布不可变 ZIP（可在采集进行中调用）** — `POST /jobs/1/publications`，
+立即返回包号（`id`），后台线程开始构建。`GET /publications/{id}` 轮询进度：
+
+```json
+{"status": "running", "stage": "papers", "progress": 42,
+ "papers_exported": 7, "citations_exported": 0}
+```
+
+完成后 `status=completed`，`file_name=publication_1.zip`，并给出 `download_url`。
+构建期间采集、重试、查询全部继续可用。
+
+**8. 下载与复跑** — `GET /publications/1/download`（Swagger 中可直接下载，
+或 `curl -o p1.zip`）。ZIP 内三个文件：
+
+| 文件 | 内容 |
+|---|---|
+| `papers.csv` | 列 `url,depth,title,status`（URL、深度、题名、状态），按深度、登记序 |
+| `citations.csv` | 列 `src_url,dst_url`（起点 URL、终点 URL），按起点、终点序 |
+| `meta.json` | `job_id`、`seed_url`、`max_depth`、`job_status`、`papers_rows`、`citations_rows`、生成时间与列定义 |
+
+同一包号重复下载得到**逐字节相同**的 ZIP（包不可变）；重试补抓后再发布得到**新包号**，
+两个包分别固化各自时刻的语料（例如重试前的包里 `broken.html` 为 `failed`、题名为空，
+重试后的包里为 `done` 且带题名）。`meta.json` 的两个行数与 CSV 实际数据行数严格一致。
+
+**9. 发布错误查询** — 失败的包 `status=failed` 并带 `error` 字段（`GET /publications/{id}`
+或 `GET /publications?job_id=1`）；未完成的包不开放下载（返回 409 并说明当前阶段）。
+
+## 发布语义与可靠性保证
+
+- **同一完整已提交状态**：每个包由发布线程的**独立只读连接**构建，一条只读事务
+  贯穿作业行、两表计数与全部扫描。WAL 下该事务固定一个快照，后台开始读取后采集侧
+  提交的补抓 / 重试 / 深度传播一律不会混入；三表（含 `meta.json` 行数）天然对应同一状态。
+- **不阻塞业务库**：只读事务不获取写锁，扫描跑在独立连接上；进度更新走主连接的
+  短事务，扫描与打包不持有业务写事务，采集的 `IMMEDIATE` 写入照常提交。
+- **内存恒定**：两张表均以服务端游标 `fetchmany(1000)` 分批读出并直接流式写入 ZIP
+  条目，Python 侧不积累全量行，内存占用不随总论文/引用行数增长（测试以 1.6 万行验证）。
+- **先落盘后登记**：先写唯一临时文件（`O_EXCL`）→ flush + `fsync` → 同文件系统
+  原子 `rename` → 目录 `fsync` → 才在单个事务里登记 `completed` 与文件名。
+  写盘或登记失败都只会留下 `failed` 记录并清理残件，不可能出现“登记成功却缺文件”。
+- **重启恢复**：启动时，未到终态的发布任务一律标记 `failed`（`error=interrupted by restart`）
+  并删除其临时/孤儿文件；已 `completed` 且文件存在的包原样保留、继续可下载；
+  若已完成记录的文件确实丢失，则把该记录转为 `failed` 并注明原因，绝不静默误删其他包。
+
 ## 演示语料站结构
 
 ```
@@ -91,6 +137,18 @@ p0 ─┬─> p1 ─┬─> p2 ─┬─> p3 ─> p1          循环引用（登
 | GET | `/jobs/{id}/failures` | 失败 URL 及错误 |
 | GET | `/jobs/{id}/papers` | 论文查询（`status`、`depth` 过滤） |
 | GET | `/jobs/{id}/citations` | 引用边查询（`src` 过滤） |
+| POST | `/jobs/{id}/publications` | 后台发布不可变 ZIP 快照，返回包号 |
+| GET | `/publications` | 包列表（可按 `job_id` 过滤） |
+| GET | `/publications/{id}` | 包进度、行数、文件名、错误信息 |
+| GET | `/publications/{id}/download` | 按包号下载 ZIP（可重复，字节不变） |
+
+## 测试
+
+发布引擎带一套集成测试（快照隔离、流式内存、重复下载、错误守卫、重启恢复）：
+
+```bash
+python -m unittest discover -s tests -v      # 需先 pip install -r crawler/requirements.txt
+```
 
 ## 本地开发（不用 Docker）
 
@@ -98,5 +156,6 @@ p0 ─┬─> p1 ─┬─> p2 ─┬─> p3 ─> p1          循环引用（登
 pip install -r crawler/requirements.txt
 ( cd papersite && python server.py )                       # :8080
 ( cd crawler && DATABASE_PATH=./crawler.db \
+    PACKAGES_DIR=./packages \
     uvicorn app.main:app --port 8000 )                     # :8000/docs
 ```
