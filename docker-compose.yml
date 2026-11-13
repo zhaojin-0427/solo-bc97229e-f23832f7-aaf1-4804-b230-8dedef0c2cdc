@@ -1,0 +1,19 @@
+services:
+  papersite:
+    build: ./papersite
+    ports:
+      - "8080:8080"
+
+  crawler:
+    build: ./crawler
+    environment:
+      DATABASE_PATH: /data/crawler.db
+    volumes:
+      - crawler_data:/data        # crawl state survives restarts
+    ports:
+      - "8000:8000"               # interactive API docs: http://localhost:8000/docs
+    depends_on:
+      - papersite
+
+volumes:
+  crawler_data:
